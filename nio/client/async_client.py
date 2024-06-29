@@ -149,6 +149,8 @@ from ..responses import (
     ProfileSetAvatarResponse,
     ProfileSetDisplayNameError,
     ProfileSetDisplayNameResponse,
+    PublicRoomsError,
+    PublicRoomsResponse,
     RegisterErrorResponse,
     RegisterInteractiveError,
     RegisterInteractiveResponse,
@@ -189,6 +191,7 @@ from ..responses import (
     RoomPutAliasResponse,
     RoomPutStateError,
     RoomPutStateResponse,
+    RoomReadMarkersError,
     RoomReadMarkersResponse,
     RoomRedactError,
     RoomRedactResponse,
@@ -446,6 +449,9 @@ class AsyncClient(Client):
             config = AsyncClientConfig(**config.__dict__)
 
         self.config: AsyncClientConfig = config or AsyncClientConfig()
+
+        # The flag used to gracefully stop `sync_forever`.
+        self._stop_sync_forever = False
 
         super().__init__(user, device_id, store_path, self.config)
 
@@ -1318,8 +1324,9 @@ class AsyncClient(Client):
         """
 
         first_sync = True
+        self._stop_sync_forever = False
 
-        while True:
+        while not self._stop_sync_forever:
             try:
                 use_filter = (
                     first_sync_filter
@@ -1382,6 +1389,14 @@ class AsyncClient(Client):
                     task.cancel()
 
                 raise
+
+    def stop_sync_forever(self):
+        """Request that the `sync_forever` loop exits gracefully.
+
+        If a `sync_forever` function is running, it will finish its sync loop and exit, leaving this `AsyncClient` in
+        a consistent state. In particular, it will be possible to run `sync_forever` again at a later point.
+        """
+        self._stop_sync_forever = True
 
     @logged_in_async
     @store_loaded
@@ -1888,14 +1903,13 @@ class AsyncClient(Client):
                 fetched per chunk while iterating. Changing this value can affect performance.
                 Homeservers will apply a default value, and override this with a maximum value.
         """
-        paginate_from, paginate_to = None, None
+        paginate_from = None
         while True:
             method, path = Api.room_get_threads(
                 self.access_token,
                 room_id,
                 include,
                 paginate_from,
-                paginate_to,
                 limit,
             )
             response = await self._send(
@@ -2898,7 +2912,7 @@ class AsyncClient(Client):
         fully_read_event: str,
         read_event: Optional[str] = None,
         private_read_event: Optional[str] = None,
-    ):
+    ) -> Union[RoomReadMarkersResponse, RoomReadMarkersError]:
         """Update the fully read marker (and optionally the read receipt
         and/or private read receipt) for a room.
 
@@ -3573,6 +3587,44 @@ class AsyncClient(Client):
 
         method, path = Api.whoami(self.access_token)
         return await self._send(WhoamiResponse, method, path)
+
+    async def list_public_rooms(
+        self,
+        limit: Optional[int] = None,
+        server: Optional[str] = None,
+        since: Optional[str] = None,
+        filter_generic_search_term: Optional[str] = None,
+        filter_room_types: List[Union[str, None]] = None,
+        include_all_networks: bool = False,
+        third_party_instance_id: Optional[str] = None,
+    ) -> Union[PublicRoomsResponse, PublicRoomsError]:
+        """Lists the public rooms on the server, with optional filters.
+
+        This API returns paginated responses.
+        The rooms are ordered by the number of joined members, with the largest rooms first.
+        If including any arguments besides `limit`, `server`, or `filter`, the client must have a valid access token.
+
+        Args:
+            limit (int, optional): The maximum number of rooms to return.
+            server (str, optional): The server to fetch the public room lists from. Defaults to the local server. Case sensitive.
+            since (str, optional): A pagination token from a previous request's `next_batch`/`prev_batch`
+            filter_generic_search_term (str, optional): An optional string to search for in the room metadata, e.g. name, topic, canonical alias, etc.
+            filter_room_types (list[str, None], optional): A list of room types to filter for; including `None` includes rooms without a type.
+            include_all_networks (boolean, optional): Whether to include all known networks/protocols from application services on the homeserver
+            third_party_instance_id (str, optional): The specific third-party network/protocol to request from the homeserver. Can only be used if `include_all_networks` is false
+        """
+
+        method, path, data = Api.public_rooms(
+            self.access_token,
+            limit,
+            server,
+            since,
+            filter_generic_search_term,
+            filter_room_types,
+            include_all_networks,
+            third_party_instance_id,
+        )
+        return await self._send(PublicRoomsResponse, method, path, data)
 
     @logged_in_async
     async def set_pushrule(

@@ -141,6 +141,7 @@ from nio.api import (
 )
 from nio.client.async_client import connect_wrapper, on_request_chunk_sent
 from nio.crypto import OlmDevice, Session, decrypt_attachment
+from nio.responses import PublicRoom, PublicRoomsResponse
 
 BASE_URL_V1 = f"https://example.org{MATRIX_API_PATH_V1}"
 BASE_URL_V3 = f"https://example.org{MATRIX_API_PATH_V3}"
@@ -409,6 +410,10 @@ class TestClass:
     def whoami_response(self):
         return self._load_response("tests/data/whoami_response.json")
 
+    @property
+    def list_public_rooms_response(self):
+        return self._load_response("tests/data/list_public_rooms.json")
+
     async def test_mxc_to_http(self, unauthed_async_client):
         mxc = "mxc://privacytools.io/123foo"
         url_path = f"{MATRIX_MEDIA_API_PATH}/download/privacytools.io/123foo"
@@ -675,6 +680,47 @@ class TestClass:
         await unauthed_async_client.whoami()
         assert unauthed_async_client.user_id != "unknown"
         assert unauthed_async_client.device_id != "unknown"
+
+    async def test_list_public_rooms(self, async_client, aioresponse):
+        aioresponse.get(
+            f"{BASE_URL_V3}/publicRooms?access_token=abc123&limit=1&server=bleecker.street",
+            status=200,
+            payload=self.list_public_rooms_response,
+        )
+        aioresponse.post(
+            f"{BASE_URL_V3}/publicRooms?access_token=abc123&server=bleecker.street",
+            status=200,
+            body={
+                "filter": {
+                    "generic_search_term": "cheese",
+                    "room_types": [
+                        None,
+                        "m.space",
+                    ],
+                },
+                "include_all_networks": False,
+                "limit": 1,
+                "third_party_instance_id": "irc",
+            },
+            payload=self.list_public_rooms_response,
+        )
+
+        get_response = await async_client.list_public_rooms(
+            limit=1, server="bleecker.street"
+        )
+        post_response = await async_client.list_public_rooms(
+            limit=1,
+            server="bleecker.street",
+            filter_generic_search_term="cheese",
+            filter_room_types=[None, "m.space"],
+            third_party_instance_id="irc",
+        )
+
+        for response in [get_response, post_response]:
+            assert isinstance(response, PublicRoomsResponse)
+            assert response.total_room_count_estimate == 115
+            assert len(response.public_rooms) == 1
+            assert isinstance(response.public_rooms[0], PublicRoom)
 
     async def test_logout(self, unauthed_async_client, aioresponse):
         aioresponse.post(
@@ -2837,6 +2883,53 @@ class TestClass:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+    async def test_stop_sync_forever(self, async_client, aioresponse, event_loop):
+        sync_url = re.compile(
+            rf"^https://example\.org{MATRIX_API_PATH_V3}/sync\?access_token=.*"
+        )
+
+        aioresponse.get(
+            sync_url,
+            status=200,
+            payload=self.sync_response,
+        )
+
+        aioresponse.get(sync_url, status=200, payload=self.empty_sync, repeat=True)
+
+        aioresponse.post(
+            f"{BASE_URL_V3}/keys/upload?access_token=abc123",
+            status=200,
+            payload=self.final_keys_upload_response,
+        )
+
+        aioresponse.post(
+            f"{BASE_URL_V3}/keys/query?access_token=abc123",
+            status=200,
+            payload=self.keys_query_response,
+            repeat=True,
+        )
+
+        await async_client.receive_response(
+            LoginResponse.from_dict(self.login_response)
+        )
+
+        received = set()
+
+        async def event_callback(event: PresenceEvent):
+            received.add(event.user_id)
+            async_client.stop_sync_forever()
+
+        async_client.add_presence_callback(event_callback, PresenceEvent)
+
+        task: asyncio.Task = event_loop.create_task(
+            async_client.sync_forever(loop_sleep_time=100)
+        )
+
+        await asyncio.wait_for(task, 120)
+
+        assert "@example:localhost" in received
+        assert "@example2:localhost" in received
 
     async def test_session_unwedging(self, async_client_pair, aioresponse):
         alice, bob = async_client_pair
